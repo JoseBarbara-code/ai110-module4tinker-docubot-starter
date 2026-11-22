@@ -9,6 +9,18 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+# Common question/filler words ignored when scoring a query.
+# Kept deliberately small so topic words (e.g. "sqlite", "token") always count.
+QUERY_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "were", "be", "do", "does", "did", "can",
+    "i", "me", "my", "it", "this", "that", "these", "there", "any",
+    "what", "which", "where", "when", "who", "whom", "whose", "why", "how",
+}
+
+HEADING_PATTERN = re.compile(r"^#{1,6}\s")
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -19,11 +31,17 @@ class DocuBot:
         self.docs_folder = docs_folder
         self.llm_client = llm_client
 
-        # Load documents into memory
+        # Load documents into memory (full files, unchanged for existing callers)
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Split documents into heading-based sections for retrieval.
+        # Maps unique section_id -> (filename, section_text)
+        self.sections = self.build_sections(self.documents)
+
+        # Build a retrieval index over sections: word -> [section_id, ...]
+        self.index = self.build_index(
+            [(section_id, text) for section_id, (_, text) in self.sections.items()]
+        )
 
     # -----------------------------------------------------------
     # Document Loading
@@ -45,6 +63,66 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
+    # Tokenization Helper
+    # -----------------------------------------------------------
+
+    def _tokenize(self, text):
+        """
+        Lowercases text and extracts words, dropping punctuation.
+        Underscores are treated as separators, so identifiers like
+        auth_utils or AUTH_SECRET_KEY also match "auth", "utils", etc.
+        Returns a list of tokens (duplicates preserved).
+        """
+        return re.findall(r"[a-z0-9]+", text.lower())
+
+    def _query_terms(self, query):
+        """
+        Returns the set of meaningful query words: tokens minus common
+        question/filler words. A one-word query like "SQLite" is kept.
+        """
+        return set(self._tokenize(query)) - QUERY_STOP_WORDS
+
+    # -----------------------------------------------------------
+    # Section Splitting (Phase 1, Part 3)
+    # -----------------------------------------------------------
+
+    def _split_by_headings(self, text):
+        """
+        Splits Markdown text into sections. Each section starts at a heading
+        line (#, ##, ...) and keeps that heading with its body text.
+        Text before the first heading becomes its own section, and a file
+        with no headings stays as one section. Lines inside ``` code fences
+        are never treated as headings.
+        Returns a list of non-empty section strings.
+        """
+        sections = []
+        current = []
+        in_fence = False
+        for line in text.splitlines():
+            if line.strip().startswith("```"):
+                in_fence = not in_fence
+            if not in_fence and HEADING_PATTERN.match(line) and current:
+                sections.append("\n".join(current).strip())
+                current = []
+            current.append(line)
+        if current:
+            sections.append("\n".join(current).strip())
+        return [s for s in sections if s]
+
+    def build_sections(self, documents):
+        """
+        Splits each (filename, text) document into heading-based sections.
+        Returns a dict mapping a unique section_id (e.g. "API_REFERENCE.md#7")
+        to a (filename, section_text) tuple, so sections from the same file
+        can be indexed and scored independently.
+        """
+        sections = {}
+        for filename, text in documents:
+            for i, section_text in enumerate(self._split_by_headings(text)):
+                sections[f"{filename}#{i}"] = (filename, section_text)
+        return sections
+
+    # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
@@ -62,9 +140,15 @@ class DocuBot:
 
         Keep this simple: split on whitespace, lowercase tokens,
         ignore punctuation if needed.
+
+        documents: list of (key, text) pairs. The key can be a filename or,
+        as used in __init__, a unique section_id.
         """
         index = {}
-        # TODO: implement simple indexing
+        for key, text in documents:
+            # set() so each key is recorded at most once per word
+            for word in set(self._tokenize(text)):
+                index.setdefault(word, []).append(key)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +165,9 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        query_words = self._query_terms(query)
+        text_words = set(self._tokenize(text))
+        return len(query_words & text_words)
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,8 +176,26 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
-        results = []
-        # TODO: implement retrieval logic
+        # Use the index to find candidate sections sharing a meaningful query word.
+        # If no meaningful word matches, candidates stays empty and we return [].
+        candidates = set()
+        for word in self._query_terms(query):
+            candidates.update(self.index.get(word, []))
+
+        # Score each candidate section independently, skipping zero scores
+        scored = []
+        for section_id in candidates:
+            filename, text = self.sections[section_id]
+            score = self.score_document(query, text)
+            if score > 0:
+                scored.append((score, filename, section_id, text))
+
+        # Sort by score descending; break ties by filename, then section order
+        scored.sort(
+            key=lambda item: (-item[0], item[1], int(item[2].rsplit("#", 1)[1]))
+        )
+
+        results = [(filename, text) for _, filename, _, text in scored]
         return results[:top_k]
 
     # -----------------------------------------------------------
